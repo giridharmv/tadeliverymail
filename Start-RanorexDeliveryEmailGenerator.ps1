@@ -7,11 +7,9 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $baseUrl = "http://127.0.0.1:$Port/"
-$AllowedOrigins = @(
-    'https://giridharmv.github.io',
-    "http://127.0.0.1:$Port",
-    "http://localhost:$Port"
-)
+$AllowedOrigins = @('https://giridharmv.github.io')
+# Pages served from this machine (this service, VS Code Live Server, etc.) on any port.
+$LoopbackOriginPattern = '^http://(127\.0\.0\.1|localhost)(:\d+)?$'
 $AllowedTfsHost = 'saturn.tfs.siemens.net'
 $listener = [System.Net.HttpListener]::new()
 $listener.Prefixes.Add($baseUrl)
@@ -62,7 +60,7 @@ namespace CredMan
 }
 
 # Auto-launch browser once
-$htmlPath = Join-Path $PSScriptRoot 'RanorexDeliveryEmailGenerator.html'
+$htmlPath = Join-Path $PSScriptRoot 'index.html'
 
 # Thread-safe state shared by every pooled runspace (synchronized hashtables are safe for
 # concurrent read/write from multiple threads without extra locking for simple get/set use).
@@ -540,7 +538,7 @@ try {
         # Only the hosted page / local origins may call this service (it can use the stored PAT and drive Outlook).
         $origin = $context.Request.Headers['Origin']
         if ($origin) {
-            if ($AllowedOrigins -notcontains $origin) {
+            if (($AllowedOrigins -notcontains $origin) -and ($origin -notmatch $LoopbackOriginPattern)) {
                 Log-Message "Rejected request from origin: $origin"
                 $context.Response.StatusCode = 403
                 $context.Response.Close()

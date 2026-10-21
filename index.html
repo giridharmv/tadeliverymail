@@ -2931,6 +2931,7 @@
         // Port of the local Start-RanorexDeliveryEmailGenerator.ps1 service on the visitor's own machine.
         const DEFAULT_PROXY_BASE_URL = 'http://127.0.0.1:8768';
         const TFS_CONNECTOR_PROTOCOL_URL = 'ranorex-tfs://connect';
+        const TFS_CONNECTOR_SETUP_FILE = 'Setup-TfsConnector.cmd';
 
         // Local service the page talks to: same origin when served by it, otherwise the visitor's
         // loopback (e.g. when hosted on github.io).
@@ -2945,6 +2946,11 @@
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), timeoutMs);
             try {
+                // A file:// page has a null origin that the service rejects, so only reachability can be checked.
+                if (window.location.protocol === 'file:') {
+                    await fetch(`${getProxyBaseUrl()}/ping`, { mode: 'no-cors', signal: controller.signal });
+                    return true;
+                }
                 const response = await fetch(`${getProxyBaseUrl()}/ping`, { signal: controller.signal });
                 return response.ok;
             } catch (error) {
@@ -2961,6 +2967,35 @@
             button.textContent = label;
         }
 
+        function downloadTfsSetupFile() {
+            const scriptsBaseUrl = 'https://giridharmv.github.io/';
+            const lines = [
+                '@echo off',
+                'rem One-time installer: fetches the connector scripts into %LOCALAPPDATA% and registers them for this user.',
+                String.raw`set "DEST=%LOCALAPPDATA%\RanorexTfsConnector"`,
+                'if not exist "%DEST%" mkdir "%DEST%"',
+                String.raw`powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; foreach ($f in 'Start-RanorexDeliveryEmailGenerator.ps1','Register-RanorexProtocol.ps1') { Invoke-WebRequest -UseBasicParsing -Uri ('${scriptsBaseUrl}' + $f) -OutFile (Join-Path $env:LOCALAPPDATA ('RanorexTfsConnector\' + $f)) }"`,
+                'if errorlevel 1 (',
+                '    echo Download failed. Check your network connection and try again.',
+                '    pause',
+                '    exit /b 1',
+                ')',
+                String.raw`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%DEST%\Register-RanorexProtocol.ps1"`,
+                'timeout /t 3 >nul',
+                ''
+            ];
+            // A Blob download works regardless of how the server serves .cmd files (some show them as text).
+            const blob = new Blob([lines.join('\r\n')], { type: 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = TFS_CONNECTOR_SETUP_FILE;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
+        }
+
         async function connectTfs() {
             const button = document.getElementById('connectTfsButton');
             if (!button) return;
@@ -2969,18 +3004,36 @@
             setConnectTfsState(false, '⏳ Connecting…');
 
             try {
+                const waitForService = async seconds => {
+                    for (let attempt = 0; attempt < seconds; attempt++) {
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        if (await isLocalServiceRunning()) return true;
+                    }
+                    return false;
+                };
+
                 if (!(await isLocalServiceRunning())) {
                     // Asks the OS to start the local PowerShell service through the registered ranorex-tfs:// handler.
                     window.location.href = TFS_CONNECTOR_PROTOCOL_URL;
-                    for (let attempt = 0; attempt < 20; attempt++) {
-                        await new Promise(resolve => setTimeout(resolve, 1000));
-                        if (await isLocalServiceRunning()) break;
+                    if (!(await waitForService(20))) {
+                        // Browsers cannot run local programs unprompted, so a first-time machine needs the installer opened once.
+                        downloadTfsSetupFile();
+                        showToast(`First-time setup: open the downloaded ${TFS_CONNECTOR_SETUP_FILE} once. This page will connect automatically.`, 'warning');
+                        setConnectTfsState(false, '\u23f3 Waiting for setup\u2026');
+                        await waitForService(90);
                     }
                 }
 
                 if (!(await isLocalServiceRunning())) {
                     setConnectTfsState(false, idleLabel);
-                    showToast('Could not start the local TFS service. Run Register-RanorexProtocol.ps1 once on this machine, then click Connect TFS again.', 'error');
+                    showToast('Could not reach the local TFS service. Open the downloaded setup file, then click Connect TFS again.', 'error');
+                    return;
+                }
+
+                if (window.location.protocol === 'file:') {
+                    // Reload from the local service so requests have an origin it accepts.
+                    showToast('Service is running. Reopening this page from the local service\u2026');
+                    window.location.href = `${getProxyBaseUrl()}/`;
                     return;
                 }
 
