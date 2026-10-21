@@ -78,8 +78,36 @@
 
 		.topbar {
 		display: flex;
-		justify-content: flex-end;
+		justify-content: space-between;
+		align-items: center;
 		margin-bottom: 12px;
+		}
+
+		.connect-tfs-btn {
+		background: rgba(15, 23, 42, 0.35);
+		color: white;
+		border: 1px solid rgba(255, 255, 255, 0.2);
+		border-radius: 999px;
+		padding: 8px 14px;
+		font-size: 13px;
+		font-weight: 600;
+		cursor: pointer;
+		transition: all 0.2s ease;
+		}
+
+		.connect-tfs-btn:hover:not(:disabled) {
+		transform: translateY(-1px);
+		background: rgba(15, 23, 42, 0.5);
+		}
+
+		.connect-tfs-btn:disabled {
+		opacity: 0.7;
+		cursor: progress;
+		}
+
+		.connect-tfs-btn.connected {
+		background: var(--success);
+		border-color: var(--success);
 		}
 
 		h1 {
@@ -1298,6 +1326,7 @@
 <body>
     <div class="container">
         <div class="topbar">
+            <button id="connectTfsButton" class="connect-tfs-btn" type="button" onclick="connectTfs()">🔌 Connect TFS</button>
             <button id="themeToggle" class="theme-toggle" type="button" aria-label="Toggle light and dark mode">☀️ Light
                 mode</button>
         </div>
@@ -2899,35 +2928,105 @@
             }
         }
 
-        // Fallback used only when the page is opened directly as a file (no known server port).
+        // Port of the local Start-RanorexDeliveryEmailGenerator.ps1 service on the visitor's own machine.
         const DEFAULT_PROXY_BASE_URL = 'http://127.0.0.1:8768';
+        const TFS_CONNECTOR_PROTOCOL_URL = 'ranorex-tfs://connect';
 
-        // When the page is served by the local PowerShell proxy, the port is chosen dynamically,
-        // so derive the base URL from the current origin instead of hardcoding a port.
+        // Local service the page talks to: same origin when served by it, otherwise the visitor's
+        // loopback (e.g. when hosted on github.io).
         function getProxyBaseUrl() {
-            if (window.location.protocol === 'file:') return null;
             if (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') {
                 return `${window.location.protocol}//${window.location.host}`;
             }
-            return null;
+            return DEFAULT_PROXY_BASE_URL;
         }
+
+        async function isLocalServiceRunning(timeoutMs = 1500) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const response = await fetch(`${getProxyBaseUrl()}/ping`, { signal: controller.signal });
+                return response.ok;
+            } catch (error) {
+                return false;
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+
+        function setConnectTfsState(connected, label) {
+            const button = document.getElementById('connectTfsButton');
+            if (!button) return;
+            button.classList.toggle('connected', connected);
+            button.textContent = label;
+        }
+
+        async function connectTfs() {
+            const button = document.getElementById('connectTfsButton');
+            if (!button) return;
+            const idleLabel = '🔌 Connect TFS';
+            button.disabled = true;
+            setConnectTfsState(false, '⏳ Connecting…');
+
+            try {
+                if (!(await isLocalServiceRunning())) {
+                    // Asks the OS to start the local PowerShell service through the registered ranorex-tfs:// handler.
+                    window.location.href = TFS_CONNECTOR_PROTOCOL_URL;
+                    for (let attempt = 0; attempt < 20; attempt++) {
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        if (await isLocalServiceRunning()) break;
+                    }
+                }
+
+                if (!(await isLocalServiceRunning())) {
+                    setConnectTfsState(false, idleLabel);
+                    showToast('Could not start the local TFS service. Run Register-RanorexProtocol.ps1 once on this machine, then click Connect TFS again.', 'error');
+                    return;
+                }
+
+                const response = await fetch(`${getProxyBaseUrl()}/user-info`);
+                const info = response.ok ? await response.json() : null;
+                if (info) currentUser = { name: info.name || '', email: info.email || '' };
+
+                setConnectTfsState(true, `✅ TFS Connected${info?.name ? ` (${info.name})` : ''}`);
+                if (info && info.hasPat === false) {
+                    showToast('Connected, but no TFS credential was found on this machine. You will be asked for a PAT.', 'warning');
+                } else {
+                    showToast('Connected to TFS.');
+                }
+                loadSprintList(true);
+            } catch (error) {
+                setConnectTfsState(false, idleLabel);
+                showToast(`TFS connection failed: ${error.message || error}`, 'error');
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        // Reflect an already-running local service without launching anything.
+        document.addEventListener('DOMContentLoaded', async () => {
+            if (await isLocalServiceRunning(800)) {
+                try {
+                    const response = await fetch(`${getProxyBaseUrl()}/user-info`);
+                    const info = response.ok ? await response.json() : null;
+                    setConnectTfsState(true, `✅ TFS Connected${info?.name ? ` (${info.name})` : ''}`);
+                } catch (error) {
+                    // Leave the button in its default state.
+                }
+            }
+        });
 
         async function requestTfsJson(url, allowPatPrompt = true, requestOptions = {}) {
             const headers = { Accept: 'application/json', ...requestOptions.headers };
             if (tfsPat) headers.Authorization = `Basic ${btoa(`:${tfsPat}`)}`;
 
-            const proxyBaseUrl = getProxyBaseUrl();
-            const servedByProxy = proxyBaseUrl !== null;
-            const requestUrl = window.location.protocol === 'file:' || servedByProxy
-                ? `${proxyBaseUrl || DEFAULT_PROXY_BASE_URL}/tfs-api?url=${encodeURIComponent(url)}`
-                : url;
+            const requestUrl = `${getProxyBaseUrl()}/tfs-api?url=${encodeURIComponent(url)}`;
             let response;
             try {
                 const attempts = window.location.protocol === 'file:' ? 5 : 1;
                 for (let attempt = 1; attempt <= attempts; attempt++) {
                     try {
                         response = await fetch(requestUrl, {
-                            credentials: 'include',
                             headers,
                             ...requestOptions
                         });
@@ -2938,10 +3037,7 @@
                     }
                 }
             } catch (error) {
-                if (window.location.protocol === 'file:') {
-                    throw new Error('Unable to connect to TFS credential service.');
-                }
-                throw error;
+                throw new Error('Unable to connect to TFS credential service. Click "Connect TFS" first.');
             }
             const contentType = response.headers.get('content-type') || '';
             const responseBody = await response.text();
@@ -3843,12 +3939,8 @@
         }
 
         async function loadCurrentUser() {
-            const proxyBaseUrl = getProxyBaseUrl();
-            if (window.location.protocol !== 'file:' && proxyBaseUrl === null) return;
-
             try {
-                const baseUrl = proxyBaseUrl || DEFAULT_PROXY_BASE_URL;
-                const response = await fetch(`${baseUrl}/user-info`, { credentials: 'include' });
+                const response = await fetch(`${getProxyBaseUrl()}/user-info`);
                 if (response.ok) currentUser = await response.json();
             } catch (error) {
                 currentUser = { name: '', email: '' };
@@ -4650,7 +4742,7 @@ ${recipientListHtml}
 
             while (Date.now() - startedAt < maxWaitMs) {
                 try {
-                    const response = await fetch(`/outlook-status?id=${encodeURIComponent(requestId)}`);
+                    const response = await fetch(`${getProxyBaseUrl()}/outlook-status?id=${encodeURIComponent(requestId)}`);
                     if (response.ok) {
                         const status = await response.json();
                         setOutlookProgress(status.step, status.percent);
@@ -4679,7 +4771,7 @@ ${recipientListHtml}
                 showOutlookProgressOverlay();
 
                 const payload = buildOutlookDraftPayload(requestId);
-                const draftRequest = fetch('/create-outlook-draft', {
+                const draftRequest = fetch(`${getProxyBaseUrl()}/create-outlook-draft`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)

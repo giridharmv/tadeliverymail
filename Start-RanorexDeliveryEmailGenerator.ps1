@@ -1,18 +1,18 @@
+param(
+    # Fixed port so the hosted page (github.io) can find the service without discovery.
+    [int]$Port = 8768,
+    [switch]$NoBrowser
+)
+
 $ErrorActionPreference = 'Stop'
 
-function Get-FreeTcpPort {
-    # Bind to port 0 so the OS assigns a free ephemeral port, then release it for the HttpListener to reuse.
-    $tcpListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
-    $tcpListener.Start()
-    try {
-        return $tcpListener.LocalEndpoint.Port
-    } finally {
-        $tcpListener.Stop()
-    }
-}
-
-$port = Get-FreeTcpPort
-$baseUrl = "http://127.0.0.1:$port/"
+$baseUrl = "http://127.0.0.1:$Port/"
+$AllowedOrigins = @(
+    'https://giridharmv.github.io',
+    "http://127.0.0.1:$Port",
+    "http://localhost:$Port"
+)
+$AllowedTfsHost = 'saturn.tfs.siemens.net'
 $listener = [System.Net.HttpListener]::new()
 $listener.Prefixes.Add($baseUrl)
 $logPath = Join-Path $env:TEMP 'RanorexDeliveryEmailGenerator.log'
@@ -76,7 +76,7 @@ $TfsCacheSeconds = 45
 # (e.g. several TFS fetches triggered together from the browser) execute concurrently instead
 # of being serialized on a single thread.
 $RequestHandler = {
-    param($context, $SharedCreds, $SharedPdfCache, $TfsCache, $OutlookProgress, $TfsCacheSeconds, $htmlPath, $logPath, $scriptRoot)
+    param($context, $SharedCreds, $SharedPdfCache, $TfsCache, $OutlookProgress, $TfsCacheSeconds, $htmlPath, $logPath, $scriptRoot, $AllowedTfsHost)
 
     function Log-Message {
         param([string]$Message)
@@ -252,12 +252,23 @@ $RequestHandler = {
             }
         }
 
+        # Lightweight health check used by the page's "Connect TFS" button
+        if ($req.Url.AbsolutePath -eq '/ping') {
+            $outBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')
+            $res.StatusCode = 200
+            $res.ContentType = 'application/json; charset=utf-8'
+            $res.ContentLength64 = $outBytes.Length
+            $res.OutputStream.Write($outBytes, 0, $outBytes.Length)
+            return
+        }
+
         # Dynamic user info endpoint
         if ($req.Url.AbsolutePath -eq '/user-info') {
             $userInfo = Get-UserCredentialInfo
             $jsonInfo = @{
-                name  = $userInfo.Name
-                email = $userInfo.Email
+                name   = $userInfo.Name
+                email  = $userInfo.Email
+                hasPat = [bool]$userInfo.Pat
             } | ConvertTo-Json -Compress
 
             $outBytes = [System.Text.Encoding]::UTF8.GetBytes($jsonInfo)
@@ -294,6 +305,13 @@ $RequestHandler = {
                 $targetUrl = [System.Web.HttpUtility]::ParseQueryString($req.Url.Query)['url']
                 if (-not $targetUrl) {
                     throw "Missing 'url' query parameter."
+                }
+
+                # The stored PAT is injected into this request, so only ever forward to the TFS server.
+                $targetUri = $null
+                if (-not [System.Uri]::TryCreate($targetUrl, [System.UriKind]::Absolute, [ref]$targetUri) -or
+                    $targetUri.Scheme -ne 'https' -or $targetUri.Host -ne $AllowedTfsHost) {
+                    throw "Only https://$AllowedTfsHost URLs are allowed."
                 }
 
                 $method = $req.HttpMethod
@@ -486,8 +504,16 @@ $runspacePool.ApartmentState = [System.Threading.ApartmentState]::STA
 $runspacePool.Open()
 $pending = [System.Collections.Generic.List[object]]::new()
 
-$listener.Start()
-if (Test-Path $htmlPath) {
+try {
+    $listener.Start()
+} catch {
+    # Port already bound - most likely this service is already running.
+    Write-Host "Could not listen on $baseUrl (already running?): $($_.Exception.Message)"
+    Log-Message "Listener start failed: $_"
+    $runspacePool.Close()
+    exit 0
+}
+if ((Test-Path $htmlPath) -and -not $NoBrowser) {
     Start-Process $baseUrl
 }
 Write-Host "Server running at $baseUrl - Press Ctrl+C to exit."
@@ -511,10 +537,22 @@ try {
 
         $context = $contextTask.GetAwaiter().GetResult()
 
-        # CORS headers (set on the main thread immediately, before the request is dispatched)
-        $context.Response.Headers.Add('Access-Control-Allow-Origin', '*')
+        # Only the hosted page / local origins may call this service (it can use the stored PAT and drive Outlook).
+        $origin = $context.Request.Headers['Origin']
+        if ($origin) {
+            if ($AllowedOrigins -notcontains $origin) {
+                Log-Message "Rejected request from origin: $origin"
+                $context.Response.StatusCode = 403
+                $context.Response.Close()
+                continue
+            }
+            $context.Response.Headers.Add('Access-Control-Allow-Origin', $origin)
+            $context.Response.Headers.Add('Vary', 'Origin')
+        }
         $context.Response.Headers.Add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         $context.Response.Headers.Add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        # Required by Chrome's Private Network Access preflight for public-site -> localhost calls.
+        $context.Response.Headers.Add('Access-Control-Allow-Private-Network', 'true')
 
         $ps = [powershell]::Create()
         $ps.RunspacePool = $runspacePool
@@ -527,7 +565,8 @@ try {
             AddArgument($TfsCacheSeconds).
             AddArgument($htmlPath).
             AddArgument($logPath).
-            AddArgument($PSScriptRoot)
+            AddArgument($PSScriptRoot).
+            AddArgument($AllowedTfsHost)
 
         $handle = $ps.BeginInvoke()
         $pending.Add([pscustomobject]@{ PS = $ps; Handle = $handle })
