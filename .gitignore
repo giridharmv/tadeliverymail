@@ -1,0 +1,28 @@
+# Build outputs
+bin/
+obj/
+out/
+
+# Test results
+TestResults/
+*.trx
+*.coverage
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Logs
+*.log
+
+# Package managers
+packages/
+*.nupkg
+
+# OS files
+.DS_Store
+Thumbs.db
